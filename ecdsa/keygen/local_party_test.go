@@ -9,22 +9,24 @@ package keygen
 import (
 	"crypto/ecdsa"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"math/big"
 	"os"
 	"runtime"
 	"sync/atomic"
 	"testing"
 
+	"github.com/bnb-chain/tss-lib/v2/crypto"
+	"github.com/bnb-chain/tss-lib/v2/crypto/vss"
 	"github.com/ipfs/go-log"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/bnb-chain/tss-lib/v2/common"
-	"github.com/bnb-chain/tss-lib/v2/crypto"
 	"github.com/bnb-chain/tss-lib/v2/crypto/dlnproof"
 	"github.com/bnb-chain/tss-lib/v2/crypto/paillier"
-	"github.com/bnb-chain/tss-lib/v2/crypto/vss"
 	"github.com/bnb-chain/tss-lib/v2/test"
 	"github.com/bnb-chain/tss-lib/v2/tss"
 )
@@ -78,6 +80,14 @@ func TestStartRound1Paillier(t *testing.T) {
 	}
 	assert.Equal(t, 2048/8, len1)
 	assert.Equal(t, 2048/8, len2)
+
+	// 打印 Paillier 私钥和公钥
+	privateKey := lp.data.PaillierSK.LambdaN.Bytes()
+	publicKey := lp.data.PaillierSK.PublicKey.N.Bytes()
+
+	fmt.Printf("Paillier Private Key (LambdaN): %s\n", hex.EncodeToString(privateKey))
+	fmt.Printf("Paillier Public Key (N): %s\n", hex.EncodeToString(publicKey))
+
 }
 
 func TestFinishAndSaveH1H2(t *testing.T) {
@@ -243,6 +253,9 @@ keygen:
 			// .. here comes a workaround to recover this party's index (it was removed from save data)
 			index, err := save.OriginalIndex()
 			assert.NoErrorf(t, err, "should not be an error getting a party's index from save data")
+			t.Log("-----------------------------------------")
+			t.Log(index)
+			t.Log("-----------------------------------------")
 			tryWriteTestFixtureFile(t, index, *save)
 
 			atomic.AddInt32(&ended, 1)
@@ -362,4 +375,135 @@ func tryWriteTestFixtureFile(t *testing.T, index int, data LocalPartySaveData) {
 		t.Logf("Fixture file already exists for party %d; not re-creating: %s", index, fixtureFileName)
 	}
 	//
+}
+
+func TestUseEcdsa(t *testing.T) {
+
+	// 定义参与者数量和门限值
+	n := 5 // 总参与者数量
+	s := 2 // 门限值
+
+	// --------------------- 阶段 1: 密钥生成 ---------------------
+	fmt.Println("=== 密钥生成阶段 ===")
+
+	pIDs := tss.GenerateTestPartyIDs(n) //	pIDs = tss.GenerateTestPartyIDs(testParticipants)
+
+	p2pCtx := tss.NewPeerContext(pIDs)
+	parties := make([]*LocalParty, 0, len(pIDs))
+
+	errCh := make(chan *tss.Error, len(pIDs))
+	outCh := make(chan tss.Message, len(pIDs))
+	// 存储每个参与者的私钥分片
+	endCh := make(chan *LocalPartySaveData, len(pIDs))
+
+	updater := test.SharedPartyUpdater
+	// 启动每个参与者的密钥生成流程
+	for i := 0; i < len(pIDs); i++ {
+		var P *LocalParty
+		params := tss.NewParameters(tss.S256(), p2pCtx, pIDs[i], len(pIDs), s)
+		// do not use in untrusted setting
+		params.SetNoProofMod()
+		// do not use in untrusted setting
+		params.SetNoProofFac()
+		P = NewLocalParty(params, outCh, endCh).(*LocalParty)
+		fmt.Printf("Party %d is starting key generation\n", P.PartyID().Index)
+		parties = append(parties, P)
+		go func(P *LocalParty) {
+			if err := P.Start(); err != nil {
+				errCh <- err
+			}
+		}(P)
+	}
+	// PHASE: keygen
+	var ended int32
+keygen:
+	for {
+		fmt.Printf("ACTIVE GOROUTINES: %d\n", runtime.NumGoroutine())
+		select {
+		case err := <-errCh:
+			common.Logger.Errorf("Error: %s", err)
+			assert.FailNow(t, err.Error())
+			break keygen
+
+			// 广播消息给其他参与者
+		case msg := <-outCh:
+			dest := msg.GetTo()
+			t.Logf("dest %s", dest)
+			if dest == nil { // broadcast!
+				for _, P := range parties {
+					t.Logf(" P.PartyID()  %s partyID %d msgFrom %d ", P.PartyID(), P.PartyID().Index, msg.GetFrom().Index)
+					if P.PartyID().Index == msg.GetFrom().Index {
+						continue
+					}
+					go updater(P, msg, errCh)
+				}
+			} else { // point-to-point!
+				if dest[0].Index == msg.GetFrom().Index {
+					t.Fatalf("party %d tried to send a message to itself (%d)", dest[0].Index, msg.GetFrom().Index)
+					return
+				}
+				go updater(parties[dest[0].Index], msg, errCh)
+			}
+
+		case result := <-endCh:
+			// 输出当前处理完的参与者的相关信息
+			// 协议完成，输出签名结果
+			index, err := result.OriginalIndex()
+			assert.NoErrorf(t, err, "should not be an error getting a party's index from save data")
+
+			t.Log("-----------------------------------------")
+			t.Log(index)
+			t.Log("-----------------------------------------")
+
+			tryWriteTestFixtureFile(t, index, *result)
+
+			atomic.AddInt32(&ended, 1)
+			if atomic.LoadInt32(&ended) == int32(len(pIDs)) {
+				break keygen
+			}
+
+		}
+
+	}
+	fmt.Println("密钥生成完成！")
+
+}
+
+func TestReadFile(t *testing.T) {
+
+	fmt.Println("=== 密钥组装阶段 ===")
+	type LocalPartySaveDataJSON struct {
+		Ks          []string `json:"ks"`
+		NTildej     []string `json:"n_tilde_j"`
+		H1j         []string `json:"h1_j"`
+		H2j         []string `json:"h2_j"`
+		BigXj       []string `json:"big_x_j"`
+		PaillierPKs []string `json:"paillier_pks"`
+		ECDSAPub    string   `json:"ecdsa_pub"`
+	}
+
+	var keyPairs []*LocalPartySaveDataJSON
+	filePaths := []string{"/Users/aries/work/self/mpc/tss-lib/test/_ecdsa_fixtures/keygen_data_0.json", "/Users/aries/work/self/mpc/tss-lib/test/_ecdsa_fixtures/keygen_data_1.json"}
+	for _, filePath := range filePaths {
+		data, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			t.Logf("failed to read file %s: %v", filePath, err)
+			return
+		}
+
+		t.Log(data)
+		// var keyPair LocalPartySaveDataJSON
+		// if err := json.Unmarshal(data, &keyPair); err != nil {
+		// 	t.Logf("failed to unmarshal key pair: %v", err)
+		// 	return
+		// }
+		// keyPairs = append(keyPairs, &keyPair)
+	}
+
+	fmt.Println("=== 密钥组装完成阶段 ===")
+	for i, keyPair := range keyPairs {
+		fmt.Printf("Participant %d:\n", i+1)
+		fmt.Printf("  Public Key:  %s\n", keyPair.ECDSAPub)
+	}
+
 }
